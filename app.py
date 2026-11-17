@@ -240,72 +240,210 @@ def page_home():
                 '</span></div>', unsafe_allow_html=True)
 
 
+def predict_feature_frame(frame: pd.DataFrame, model, scaler, classes):
+    """Run the trained ANN on rows containing the exact training features."""
+    x = frame[ [f[0] for f in FEATURES] ].to_numpy(dtype=float)
+    xs = scaler.transform(x) if scaler is not None else x
+    output = np.asarray(model.predict(xs, verbose=0))
+
+    if output.ndim == 1:
+        output = output.reshape(-1, 1)
+
+    labels, confidences, attack_probabilities = [], [], []
+    if output.shape[1] == 1:
+        for row in output:
+            p_attack = float(row[0])
+            is_attack = p_attack >= 0.5
+            labels.append("Attack" if is_attack else "Normal")
+            confidences.append(p_attack if is_attack else 1.0 - p_attack)
+            attack_probabilities.append(p_attack)
+    else:
+        for row in output:
+            idx = int(np.argmax(row))
+            label = classes[idx] if idx < len(classes) else f"Class {idx}"
+            labels.append(str(label))
+            confidences.append(float(row[idx]))
+            attack_probabilities.append(
+                float(1.0 - row[classes.index("Normal")])
+                if "Normal" in classes and len(classes) == len(row)
+                else (0.0 if str(label).strip().lower() == "normal" else float(row[idx]))
+            )
+
+    result = frame.copy()
+    result["Prediction"] = labels
+    result["Confidence (%)"] = np.round(np.asarray(confidences) * 100, 2)
+    if output.shape[1] == 1:
+        result["Attack probability (%)"] = np.round(np.asarray(attack_probabilities) * 100, 2)
+    return result
+
+
+def show_prediction_visuals(results: pd.DataFrame, title: str = "Prediction summary"):
+    """Display charts calculated from actual model predictions."""
+    st.markdown(f'<h2 class="sec">{title}</h2>', unsafe_allow_html=True)
+    counts = results["Prediction"].value_counts()
+    c1, c2 = st.columns(2, gap="large")
+    with c1:
+        st.markdown("**Traffic classification count**")
+        st.bar_chart(counts.rename_axis("Class").to_frame("Records"), use_container_width=True)
+    with c2:
+        st.markdown("**Normal vs attack distribution**")
+        fig, ax = plt.subplots(figsize=(5, 3.8))
+        fig.patch.set_alpha(0)
+        ax.set_facecolor("none")
+        ax.pie(
+            counts.values,
+            labels=counts.index.astype(str),
+            autopct="%1.1f%%",
+            startangle=90,
+            wedgeprops={"width": 0.48, "edgecolor": "#000000"},
+            textprops={"color": "white", "fontsize": 10},
+        )
+        ax.axis("equal")
+        st.pyplot(fig, transparent=True)
+        plt.close(fig)
+
+    st.markdown("**Prediction confidence distribution**")
+    fig, ax = plt.subplots(figsize=(9, 2.8))
+    fig.patch.set_alpha(0)
+    ax.set_facecolor("none")
+    ax.hist(results["Confidence (%)"], bins=10, edgecolor="#111111")
+    ax.set_xlabel("Model confidence (%)")
+    ax.set_ylabel("Number of records")
+    ax.tick_params(colors="white")
+    ax.xaxis.label.set_color("white")
+    ax.yaxis.label.set_color("white")
+    for spine in ax.spines.values():
+        spine.set_color("#555555")
+    st.pyplot(fig, transparent=True)
+    plt.close(fig)
+
+
 def page_prediction():
     st.markdown('<h1 class="hero small">Intrusion prediction</h1>'
-                '<p class="sub small">Enter the flow features below and select Predict.</p>',
+                '<p class="sub small">Predict one flow manually or upload a CSV to analyse multiple network records.</p>',
                 unsafe_allow_html=True)
     model, scaler, classes, err = load_model()
     if err:
         st.warning(f"{err} Train the ANN and save it into the `artifacts` folder, then reload this page.")
 
-    with st.form("predict_form"):
-        st.markdown('<div class="card-title">Network traffic features</div>', unsafe_allow_html=True)
-        values = {}
-        cols = st.columns(3)
-        for i, (name, label, lo, hi, helptext) in enumerate(FEATURES):
-            with cols[i % 3]:
-                values[name] = st.number_input(label, min_value=lo, max_value=hi, value=0.0,
-                                               format="%.6f", help=helptext, key=f"f_{name}")
-        submitted = st.form_submit_button("Predict")
+    manual_tab, csv_tab = st.tabs(["Manual prediction", "CSV batch analysis"])
 
-    if not submitted:
-        return
-    if model is None:
-        st.error("Prediction is unavailable because the trained model is not loaded.")
-        return
+    with manual_tab:
+        with st.form("predict_form"):
+            st.markdown('<div class="card-title">Network traffic features</div>', unsafe_allow_html=True)
+            values = {}
+            cols = st.columns(3)
+            for i, (name, label, lo, hi, helptext) in enumerate(FEATURES):
+                with cols[i % 3]:
+                    values[name] = st.number_input(label, min_value=lo, max_value=hi, value=0.0,
+                                                   format="%.6f", help=helptext, key=f"f_{name}")
+            submitted = st.form_submit_button("Predict")
 
-    x = np.array([[values[f[0]] for f in FEATURES]], dtype=float)
-    problems = []
-    if not np.isfinite(x).all():
-        problems.append("All inputs must be valid numbers.")
-    if (x < 0).any():
-        problems.append("Negative values are not allowed.")
-    for name, label, lo, hi, _ in FEATURES:
-        if hi is not None and values[name] > hi:
-            problems.append(f"{label} must be at most {hi:g}.")
-    if not (x > 0).any():
-        problems.append("Every value is zero. Enter the flow's actual feature values.")
-    if problems:
-        for p in problems:
-            st.error(p)
-        return
+        if submitted:
+            if model is None:
+                st.error("Prediction is unavailable because the trained model is not loaded.")
+            else:
+                x = np.array([[values[f[0]] for f in FEATURES]], dtype=float)
+                problems = []
+                if not np.isfinite(x).all():
+                    problems.append("All inputs must be valid numbers.")
+                if (x < 0).any():
+                    problems.append("Negative values are not allowed.")
+                for name, label, lo, hi, _ in FEATURES:
+                    if hi is not None and values[name] > hi:
+                        problems.append(f"{label} must be at most {hi:g}.")
+                if not (x > 0).any():
+                    problems.append("Every value is zero. Enter the flow's actual feature values.")
+                if problems:
+                    for problem in problems:
+                        st.error(problem)
+                else:
+                    try:
+                        result = predict_feature_frame(pd.DataFrame(x, columns=[f[0] for f in FEATURES]),
+                                                       model, scaler, classes)
+                        label = str(result.iloc[0]["Prediction"])
+                        conf = float(result.iloc[0]["Confidence (%)"])
+                        if label.strip().lower() == "normal":
+                            st.markdown(f'<div class="result ok"><div class="big">Normal traffic</div>'
+                                        f'<div class="meta">Model confidence: {conf:.2f}%</div></div>',
+                                        unsafe_allow_html=True)
+                        else:
+                            st.markdown(f'<div class="result bad"><div class="big">Attack detected: {label}</div>'
+                                        f'<div class="meta">Model confidence: {conf:.2f}%</div></div>',
+                                        unsafe_allow_html=True)
+                        st.dataframe(result, use_container_width=True)
+                    except Exception as exc:  # noqa: BLE001
+                        st.error(f"Prediction failed. Check that FEATURES matches the training columns. ({exc})")
 
-    xs = scaler.transform(x) if scaler is not None else x
-    try:
-        out = model.predict(xs, verbose=0)
-    except Exception as exc:  # noqa: BLE001
-        st.error(f"The model rejected this input. Check that FEATURES matches the training columns. ({exc})")
-        return
+    with csv_tab:
+        st.markdown('<div class="card-title">Upload network traffic CSV</div>', unsafe_allow_html=True)
+        st.markdown(
+            '<p class="card-text">Upload a CSV containing the 15 model input columns. '
+            'Extra columns such as id or label are ignored. The uploaded file is processed locally by this app.</p>',
+            unsafe_allow_html=True
+        )
+        st.caption("Required columns: " + ", ".join(f[0] for f in FEATURES))
+        uploaded = st.file_uploader("Choose a CSV file", type=["csv"], key="nids_csv_upload")
+        if uploaded is not None:
+            try:
+                uploaded_df = pd.read_csv(uploaded)
+                # Match headers without case/space differences, but retain the model's required order.
+                header_lookup = {str(col).strip().lower(): col for col in uploaded_df.columns}
+                missing = [f[0] for f in FEATURES if f[0].lower() not in header_lookup]
+                if missing:
+                    st.error("CSV is missing required model features: " + ", ".join(missing))
+                    st.info("Upload the UNSW-NB15 CSV or a CSV containing all required feature columns.")
+                elif model is None:
+                    st.error("CSV prediction is unavailable because the trained ANN model is not loaded.")
+                else:
+                    selected = pd.DataFrame({
+                        f[0]: pd.to_numeric(uploaded_df[header_lookup[f[0].lower()]], errors="coerce")
+                        for f in FEATURES
+                    })
+                    numeric_ok = np.isfinite(selected.to_numpy(dtype=float)).all(axis=1)
+                    range_ok = (selected >= 0).all(axis=1)
+                    for feature_name, _, _, upper, _ in FEATURES:
+                        if upper is not None:
+                            range_ok &= selected[feature_name] <= upper
+                    nonzero_ok = (selected > 0).any(axis=1)
+                    valid_mask = numeric_ok & range_ok & nonzero_ok
+                    valid_rows = selected.loc[valid_mask].copy()
+                    invalid_count = int((~valid_mask).sum())
 
-    if out.shape[-1] == 1:  # sigmoid output
-        p_attack = float(out[0][0])
-        is_attack = p_attack >= 0.5
-        label = "Attack" if is_attack else "Normal"
-        conf = p_attack if is_attack else 1 - p_attack
-    else:  # softmax output (multiclass)
-        idx = int(np.argmax(out[0]))
-        label = classes[idx] if idx < len(classes) else f"Class {idx}"
-        is_attack = label.strip().lower() != "normal"
-        conf = float(out[0][idx])
+                    st.write(f"**Rows in file:** {len(uploaded_df)}  |  **Valid rows:** {len(valid_rows)}  |  **Skipped rows:** {invalid_count}")
+                    if invalid_count:
+                        st.warning(f"{invalid_count} row(s) were skipped because they contain missing, non-numeric, negative, out-of-range, or all-zero feature values.")
+                    if valid_rows.empty:
+                        st.error("No valid rows found. Check the CSV values and required columns.")
+                    else:
+                        if st.button("Analyse CSV with ANN", type="primary", key="analyse_csv"):
+                            try:
+                                with st.spinner("Running ANN predictions on uploaded records..."):
+                                    results = predict_feature_frame(valid_rows, model, scaler, classes)
+                                attack_count = int((results["Prediction"].str.strip().str.lower() != "normal").sum())
+                                normal_count = len(results) - attack_count
+                                st.success(f"Analysis complete: {len(results)} records classified.")
+                                m1, m2, m3 = st.columns(3)
+                                m1.metric("Total analysed", f"{len(results):,}")
+                                m2.metric("Normal records", f"{normal_count:,}")
+                                m3.metric("Attack records", f"{attack_count:,}")
+                                show_prediction_visuals(results)
+                                st.markdown('<h2 class="sec">Detailed prediction results</h2>', unsafe_allow_html=True)
+                                st.dataframe(results, use_container_width=True, height=360)
+                                csv_bytes = results.to_csv(index=False).encode("utf-8")
+                                st.download_button(
+                                    "Download prediction report (CSV)",
+                                    data=csv_bytes,
+                                    file_name="ann_nids_prediction_report.csv",
+                                    mime="text/csv",
+                                    use_container_width=True,
+                                )
+                                st.caption("Predictions are generated by the loaded ANN model. This is batch analysis of an uploaded dataset, not live network monitoring.")
+                            except Exception as exc:  # noqa: BLE001
+                                st.error(f"CSV prediction failed. Check the feature order, scaler and model compatibility. ({exc})")
+            except Exception as exc:  # noqa: BLE001
+                st.error(f"Could not read this CSV file: {exc}")
 
-    if is_attack:
-        title = "Attack detected" if label.lower() == "attack" else f"Attack detected: {label}"
-        st.markdown(f'<div class="result bad"><div class="big">{title}</div>'
-                    f'<div class="meta">Model confidence: {conf*100:.2f}%</div></div>', unsafe_allow_html=True)
-    else:
-        st.markdown(f'<div class="result ok"><div class="big">Normal traffic</div>'
-                    f'<div class="meta">Model confidence: {conf*100:.2f}%</div></div>', unsafe_allow_html=True)
-    st.caption("This is a prediction for the submitted feature values only. It is not live network monitoring.")
 
 
 def metric_card(k, v):
